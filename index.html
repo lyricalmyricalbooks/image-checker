@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Search App</title>
+    <!-- Modern typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="index.css?v=5">
+</head>
+<body>
+    <div class="app-container">
+        <header style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 1rem; margin-bottom: 2rem;">
+            <div style="text-align: left;">
+                <h1 style="margin: 0; padding-bottom: 0.2rem;">Image Matcher</h1>
+                <p style="margin: 0;">Find identical images instantly, locally.</p>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <button id="save-progress-btn" class="secondary-btn" style="padding: 0.5rem 1rem; border: 1px dashed rgba(255,255,255,0.4);" title="Download your current selections as a project file">💾 Save Progress</button>
+                <button id="load-progress-btn" class="secondary-btn" style="padding: 0.5rem 1rem; border: 1px solid rgba(255,255,255,0.2);" title="Restore a previously saved project file">📂 Load Progress</button>
+                <input type="file" id="load-progress-input" accept=".zip" class="hidden">
+            </div>
+        </header>
+
+        <main>
+            <section class="upload-section">
+                <!-- Target Images Block -->
+                <div class="upload-card">
+                    <h2>1. Target Images</h2>
+                    <p>Select the image(s) you want to find.</p>
+                    <label class="custom-file-upload">
+                        <input type="file" id="target-images" multiple accept="image/*">
+                        <span>Choose Target Images</span>
+                    </label>
+                    <div id="target-preview" class="preview-container"></div>
+                </div>
+
+                <!-- Search Directory Block -->
+                <div class="upload-card">
+                    <h2>2. Search Directory</h2>
+                    <p>Select a folder to search within.</p>
+                    <label class="custom-file-upload">
+                        <!-- webkitdirectory allows folder selection -->
+                        <input type="file" id="search-directory" webkitdirectory directory multiple>
+                        <span>Choose Folder</span>
+                    </label>
+                    <div id="directory-info" class="directory-info"></div>
+                </div>
+            </section>
+
+            <section class="action-section" style="display:flex; flex-direction:column; align-items:center; gap:1rem;">
+                <button id="search-btn" class="primary-btn" disabled>Loading AI Engine...</button>
+                <button id="clear-memory-btn" class="secondary-btn hidden" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: var(--text-muted); font-size: 0.85rem; padding: 0.4rem 1rem;">Clear Results & Memory</button>
+            </section>
+
+            <!-- Results area structure -->
+            <section id="results-section" class="results-section hidden">
+                <div class="results-header">
+                    <h2>Search Results</h2>
+                    <div id="export-bar" class="export-bar hidden">
+                        <span id="selection-count">0 selected</span>
+                        <div class="header-actions-row">
+                            <button id="export-folder-btn" class="secondary-btn">Export Folder (.zip)</button>
+                            <button id="organize-spreads-btn" class="secondary-btn">Organize Spreads</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="progress-container hidden" id="progress-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                    <p id="progress-text">Searching...</p>
+                </div>
+                <div id="results-grid" class="results-grid"></div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Spreads Workspace Overlay -->
+    <div id="spreads-workspace" class="workspace hidden">
+        <div class="workspace-header">
+            <h2>Book Spreads Builder</h2>
+            <div class="workspace-actions">
+                <button id="add-spread-btn" class="secondary-btn">Add Blank Spread</button>
+                <button id="workspace-export-pdf-btn" class="primary-btn">Export to PDF</button>
+                <button id="workspace-export-indesign-btn" class="primary-btn" style="background: linear-gradient(135deg, #FF3366, #ff0044); box-shadow: 0 4px 15px rgba(255, 51, 102, 0.4);">Export to InDesign</button>
+                <button id="close-workspace-btn" class="close-btn" style="position:relative; right:0; top:0;">&times;</button>
+            </div>
+        </div>
+        <div class="workspace-content">
+            <div id="spreads-container" class="spreads-container">
+                <!-- Spreads dynamically generated here -->
+            </div>
+        </div>
+        <div class="workspace-dock-wrapper">
+            <h3>Image Dock</h3>
+            <p style="font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.5rem;">Drag and drop your images into the book pages precisely how you want them to be placed.</p>
+            <div id="images-dock" class="images-dock dropzone">
+                <!-- Unplaced images stage here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Success / InDesign Instructions Modal -->
+    <div id="export-success-modal" class="modal hidden">
+        <div class="modal-content">
+            <button id="close-modal-x" class="close-btn">&times;</button>
+            <h3 class="modal-title" id="modal-title">🎉 PDF Exported Successfully!</h3>
+            <p class="modal-subtitle">Your images are bundled and ready to be used.</p>
+            
+            <div class="instructions-box" id="modal-instructions">
+                <h4>How to insert this into Adobe InDesign:</h4>
+                <ol>
+                    <li>Open your Adobe InDesign document.</li>
+                    <li>Press <kbd>Ctrl</kbd> + <kbd>D</kbd> (Windows) or <kbd>Cmd</kbd> + <kbd>D</kbd> (Mac) to open the <strong>Place</strong> dialog.</li>
+                    <li>Select the downloaded <code>Exported_Matched_Images.pdf</code> file.</li>
+                    <li>Check <strong>"Show Import Options"</strong> at the bottom of the dialog if you want to select specific images (pages).</li>
+                    <li>Click anywhere on your document layout to place the images!</li>
+                </ol>
+            </div>
+            
+            <button id="close-modal-btn" class="primary-btn">Awesome, thanks!</button>
+        </div>
+    </div>
+
+    <script>
+        // Global hook for OpenCV loading
+        var Module = {
+            onRuntimeInitialized: function() {
+                window.cvReady = true;
+                document.dispatchEvent(new Event('opencvReady'));
+            }
+        };
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://docs.opencv.org/4.8.0/opencv.js" async></script>
+
+    <!-- Firebase Initialization -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-analytics.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyBSlwrJL_J_dW2Ss0wQAS4sdCqkUdoeyM4",
+            authDomain: "image-matcher-50b95.firebaseapp.com",
+            projectId: "image-matcher-50b95",
+            storageBucket: "image-matcher-50b95.firebasestorage.app",
+            messagingSenderId: "12766825050",
+            appId: "1:12766825050:web:df0c977fd18be563f5e663",
+            measurementId: "G-V3BS2QP64M"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const analytics = getAnalytics(app);
+    </script>
+    
+    <script src="app.js?v=5"></script>
+</body>
+</html>
