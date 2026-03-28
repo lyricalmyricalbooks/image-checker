@@ -15,6 +15,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const sheetImageInput = document.getElementById('sheet-image');
     const scanSheetBtn = document.getElementById('scan-sheet-btn');
     const sheetStatus = document.getElementById('sheet-status');
+    const sheetSensitivityInput = document.getElementById('sheet-sensitivity');
+    const sheetMaxPhotosInput = document.getElementById('sheet-max-photos');
+    const sheetEnhanceInput = document.getElementById('sheet-enhance');
     
     const exportBar = document.getElementById('export-bar');
     const organizeSpreadsBtn = document.getElementById('organize-spreads-btn');
@@ -339,33 +342,76 @@ document.addEventListener('DOMContentLoaded', () => {
         return dst;
     }
 
-    async function extractPhotosFromSheet(file) {
-        if (!isCvReady) {
-            throw new Error('Computer vision engine is still loading.');
+    function computeIoU(a, b) {
+        const x1 = Math.max(a.x, b.x);
+        const y1 = Math.max(a.y, b.y);
+        const x2 = Math.min(a.x + a.w, b.x + b.w);
+        const y2 = Math.min(a.y + a.h, b.y + b.h);
+        const interW = Math.max(0, x2 - x1);
+        const interH = Math.max(0, y2 - y1);
+        const interArea = interW * interH;
+        if (interArea <= 0) return 0;
+        const unionArea = (a.w * a.h) + (b.w * b.h) - interArea;
+        return interArea / Math.max(unionArea, 1);
+    }
+
+    function preprocessSheet(gray, options) {
+        const blur = new cv.Mat();
+        cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+
+        if (!options.enhance) {
+            return { base: blur, matsToDelete: [] };
         }
 
-        const imgEl = await loadImage(file);
-        const src = getMatFromImage(imgEl);
-        if (!src) throw new Error('Unable to read photo sheet.');
+        const equalized = new cv.Mat();
+        cv.equalizeHist(blur, equalized);
+        blur.delete();
 
-        const gray = new cv.Mat();
-        const blur = new cv.Mat();
+        const denoised = new cv.Mat();
+        cv.bilateralFilter(equalized, denoised, 7, 50, 50);
+        equalized.delete();
+
+        return { base: denoised, matsToDelete: [] };
+    }
+
+    function collectContoursForPass(src, preprocessed, passId, options, candidates, diagnostics) {
         const edges = new cv.Mat();
+        const binary = new cv.Mat();
         const contours = new cv.MatVector();
         const hierarchy = new cv.Mat();
 
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-        cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-        cv.Canny(blur, edges, 40, 140);
-        const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.dilate(edges, edges, kernel);
+        const lower = Math.max(10, 15 + (options.sensitivity * 7));
+        const upper = Math.min(230, 90 + (options.sensitivity * 16));
 
-        cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+        if (passId === 0) {
+            cv.Canny(preprocessed, edges, lower, upper);
+            const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+            cv.dilate(edges, edges, kernel);
+            kernel.delete();
+            cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+        } else if (passId === 1) {
+            cv.adaptiveThreshold(preprocessed, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 5);
+            cv.bitwise_not(binary, binary);
+            const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(4, 4));
+            cv.morphologyEx(binary, binary, cv.MORPH_CLOSE, kernel);
+            kernel.delete();
+            cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        } else {
+            cv.threshold(preprocessed, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+            cv.bitwise_not(binary, binary);
+            const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+            cv.morphologyEx(binary, binary, cv.MORPH_OPEN, kernel);
+            kernel.delete();
+            cv.findContours(binary, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+        }
 
-        const minArea = src.rows * src.cols * 0.004;
-        const maxArea = src.rows * src.cols * 0.35;
-        const candidates = [];
+        const minAreaRatio = 0.002 + ((5 - options.sensitivity) * 0.0005);
+        const maxAreaRatio = 0.5;
+        const minArea = src.rows * src.cols * minAreaRatio;
+        const maxArea = src.rows * src.cols * maxAreaRatio;
+        const minDimension = Math.max(70, Math.floor(Math.min(src.cols, src.rows) * 0.07));
 
+        let passAccepted = 0;
         for (let i = 0; i < contours.size(); i++) {
             const contour = contours.get(i);
             const area = cv.contourArea(contour);
@@ -374,10 +420,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 continue;
             }
 
-            const rect = cv.minAreaRect(contour);
-            const rectArea = rect.size.width * rect.size.height;
-            const fillRatio = area / Math.max(rectArea, 1);
-            if (fillRatio < 0.55) {
+            const rect = cv.boundingRect(contour);
+            const contourPerimeter = cv.arcLength(contour, true);
+            const compactness = (4 * Math.PI * area) / Math.max(contourPerimeter * contourPerimeter, 1);
+            if (rect.width < minDimension || rect.height < minDimension || compactness < 0.15) {
                 contour.delete();
                 continue;
             }
@@ -387,17 +433,80 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!warped) continue;
 
             const ratio = warped.cols / warped.rows;
-            if (ratio < 0.45 || ratio > 2.2) {
+            if (ratio < 0.35 || ratio > 2.8) {
                 warped.delete();
                 continue;
             }
 
-            candidates.push({ mat: warped, area: warped.cols * warped.rows });
+            const bbox = { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+            const duplicate = candidates.some(existing => computeIoU(existing.bbox, bbox) > 0.55);
+            if (duplicate) {
+                warped.delete();
+                continue;
+            }
+
+            const qualityGray = new cv.Mat();
+            const lap = new cv.Mat();
+            cv.cvtColor(warped, qualityGray, cv.COLOR_RGBA2GRAY);
+            cv.Laplacian(qualityGray, lap, cv.CV_64F);
+            const lapStats = cv.meanStdDev(lap);
+            const contrastStats = cv.meanStdDev(qualityGray);
+            const sharpness = Math.pow(lapStats.stddev.doubleAt(0, 0), 2);
+            const contrast = contrastStats.stddev.doubleAt(0, 0);
+            const sizeScore = Math.min((warped.cols * warped.rows) / 220000, 1);
+            const qualityScore = (Math.min(sharpness / 220, 1) * 0.5) + (Math.min(contrast / 45, 1) * 0.3) + (sizeScore * 0.2);
+            qualityGray.delete();
+            lap.delete();
+            lapStats.mean.delete();
+            lapStats.stddev.delete();
+            contrastStats.mean.delete();
+            contrastStats.stddev.delete();
+
+            candidates.push({
+                mat: warped,
+                area: warped.cols * warped.rows,
+                bbox,
+                passId,
+                qualityScore
+            });
+            passAccepted++;
         }
 
-        candidates.sort((a, b) => b.area - a.area);
-        const limited = candidates.slice(0, 60);
-        candidates.slice(60).forEach(item => item.mat.delete());
+        diagnostics.push(`Pass ${passId + 1}: ${passAccepted} candidates`);
+
+        edges.delete();
+        binary.delete();
+        contours.delete();
+        hierarchy.delete();
+    }
+
+    async function extractPhotosFromSheet(file) {
+        if (!isCvReady) {
+            throw new Error('Computer vision engine is still loading.');
+        }
+
+        const imgEl = await loadImage(file);
+        const src = getMatFromImage(imgEl);
+        if (!src) throw new Error('Unable to read photo sheet.');
+
+        const scanOptions = {
+            sensitivity: parseInt(sheetSensitivityInput?.value || '3', 10),
+            maxPhotos: parseInt(sheetMaxPhotosInput?.value || '36', 10),
+            enhance: sheetEnhanceInput?.checked !== false
+        };
+        const gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        const prepared = preprocessSheet(gray, scanOptions);
+        const diagnostics = [];
+        const candidates = [];
+        for (let pass = 0; pass < 3; pass++) {
+            collectContoursForPass(src, prepared.base, pass, scanOptions, candidates, diagnostics);
+            if (candidates.length >= scanOptions.maxPhotos) break;
+        }
+
+        candidates.sort((a, b) => (b.qualityScore - a.qualityScore) || (b.area - a.area));
+        const limited = candidates.slice(0, scanOptions.maxPhotos);
+        candidates.slice(scanOptions.maxPhotos).forEach(item => item.mat.delete());
 
         const files = [];
         for (let i = 0; i < limited.length; i++) {
@@ -413,15 +522,12 @@ document.addEventListener('DOMContentLoaded', () => {
             files.push(new File([blob], `sheet_photo_${String(i + 1).padStart(2, '0')}.jpg`, { type: 'image/jpeg' }));
         }
 
+        prepared.base.delete();
+        prepared.matsToDelete.forEach(mat => mat.delete());
         src.delete();
         gray.delete();
-        blur.delete();
-        edges.delete();
-        kernel.delete();
-        contours.delete();
-        hierarchy.delete();
 
-        return files;
+        return { files, diagnostics };
     }
 
     // Process Target Images when selected
@@ -495,12 +601,13 @@ document.addEventListener('DOMContentLoaded', () => {
             sheetStatus.textContent = 'Scanning photo sheet and extracting each printed photo...';
 
             try {
-                const extractedFiles = await extractPhotosFromSheet(pendingSheetImage);
+                const scanResult = await extractPhotosFromSheet(pendingSheetImage);
+                const extractedFiles = scanResult.files;
                 if (extractedFiles.length === 0) {
                     sheetStatus.textContent = 'No photo blocks detected. Try a sharper image with less glare.';
                 } else {
                     await processTargets(extractedFiles);
-                    sheetStatus.textContent = `Detected ${extractedFiles.length} photos and loaded them as targets.`;
+                    sheetStatus.textContent = `Detected ${extractedFiles.length} photos and loaded them as targets. ${scanResult.diagnostics.join(' • ')}`;
                 }
             } catch (err) {
                 console.error('Photo sheet scan failed', err);
