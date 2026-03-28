@@ -12,6 +12,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const saveProgressBtn = document.getElementById('save-progress-btn');
     const loadProgressBtn = document.getElementById('load-progress-btn');
     const loadProgressInput = document.getElementById('load-progress-input');
+    const sheetImageInput = document.getElementById('sheet-image');
+    const scanSheetBtn = document.getElementById('scan-sheet-btn');
+    const sheetStatus = document.getElementById('sheet-status');
     
     const exportBar = document.getElementById('export-bar');
     const organizeSpreadsBtn = document.getElementById('organize-spreads-btn');
@@ -43,6 +46,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let isCvReady = window.cvReady || false;
     let selectedFiles = []; // Array of { file, card, badge }
     let draggedElement = null; // HTML element currently being dragged
+    let pendingSheetImage = null;
 
     /* ========================================================================= */
     /* ========================= INDEXEDDB MEMORY ============================== */
@@ -148,6 +152,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (targetInput.files.length > 0) {
             processTargets(Array.from(targetInput.files));
         }
+        if (pendingSheetImage && scanSheetBtn && !scanSheetBtn.disabled) {
+            scanSheetBtn.click();
+        }
     });
 
     // Allows the UI to update unblock during heavy synchronous-like loops
@@ -170,17 +177,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Convert Image Element to cv.Mat
-    function getMatFromImage(imgElement) {
+    function getMatFromImage(imgElement, maxDim = 600) {
         const canvas = document.createElement('canvas');
         canvas.width = imgElement.naturalWidth || imgElement.width || 300;
         canvas.height = imgElement.naturalHeight || imgElement.height || 300;
         
         // Scale down huge images to prevent freezing the browser
-        const MAX_DIM = 600;
         let w = canvas.width;
         let h = canvas.height;
-        if (w > MAX_DIM || h > MAX_DIM) {
-            const ratio = Math.min(MAX_DIM/w, MAX_DIM/h);
+        if (w > maxDim || h > maxDim) {
+            const ratio = Math.min(maxDim/w, maxDim/h);
             w = Math.floor(w * ratio);
             h = Math.floor(h * ratio);
         }
@@ -225,6 +231,155 @@ document.addEventListener('DOMContentLoaded', () => {
         mat.delete();
 
         return { keypoints, descriptors };
+    }
+
+    function orderCornerPoints(points) {
+        const sums = points.map(p => p.x + p.y);
+        const diffs = points.map(p => p.x - p.y);
+        const topLeft = points[sums.indexOf(Math.min(...sums))];
+        const bottomRight = points[sums.indexOf(Math.max(...sums))];
+        const topRight = points[diffs.indexOf(Math.max(...diffs))];
+        const bottomLeft = points[diffs.indexOf(Math.min(...diffs))];
+        return [topLeft, topRight, bottomRight, bottomLeft];
+    }
+
+    function cropRectFromContour(srcMat, contour) {
+        const peri = cv.arcLength(contour, true);
+        const approx = new cv.Mat();
+        cv.approxPolyDP(contour, approx, 0.04 * peri, true);
+        let points = [];
+
+        if (approx.rows === 4) {
+            for (let i = 0; i < 4; i++) {
+                points.push({
+                    x: approx.intPtr(i, 0)[0],
+                    y: approx.intPtr(i, 0)[1]
+                });
+            }
+            approx.delete();
+        } else {
+            approx.delete();
+            const bound = cv.boundingRect(contour);
+            if (bound.width < 80 || bound.height < 80) return null;
+            points = [
+                { x: bound.x, y: bound.y },
+                { x: bound.x + bound.width, y: bound.y },
+                { x: bound.x + bound.width, y: bound.y + bound.height },
+                { x: bound.x, y: bound.y + bound.height }
+            ];
+        }
+
+        const [tl, tr, br, bl] = orderCornerPoints(points);
+
+        const widthA = Math.hypot(br.x - bl.x, br.y - bl.y);
+        const widthB = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+        const maxWidth = Math.max(Math.floor(widthA), Math.floor(widthB));
+
+        const heightA = Math.hypot(tr.x - br.x, tr.y - br.y);
+        const heightB = Math.hypot(tl.x - bl.x, tl.y - bl.y);
+        const maxHeight = Math.max(Math.floor(heightA), Math.floor(heightB));
+
+        if (maxWidth < 80 || maxHeight < 80) return null;
+
+        const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+            tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y
+        ]);
+        const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+            0, 0, maxWidth - 1, 0, maxWidth - 1, maxHeight - 1, 0, maxHeight - 1
+        ]);
+        const M = cv.getPerspectiveTransform(srcTri, dstTri);
+        const dst = new cv.Mat();
+        cv.warpPerspective(srcMat, dst, M, new cv.Size(maxWidth, maxHeight));
+        srcTri.delete();
+        dstTri.delete();
+        M.delete();
+
+        return dst;
+    }
+
+    async function extractPhotosFromSheet(file) {
+        if (!isCvReady) {
+            throw new Error('Computer vision engine is still loading.');
+        }
+
+        const imgEl = await loadImage(file);
+        const src = getMatFromImage(imgEl, 2200);
+        if (!src) throw new Error('Unable to read photo sheet.');
+
+        const gray = new cv.Mat();
+        const blur = new cv.Mat();
+        const edges = new cv.Mat();
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+        cv.Canny(blur, edges, 25, 120);
+        const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+        cv.dilate(edges, edges, kernel);
+
+        cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+        const minArea = src.rows * src.cols * 0.0015;
+        const maxArea = src.rows * src.cols * 0.35;
+        const candidates = [];
+
+        for (let i = 0; i < contours.size(); i++) {
+            const contour = contours.get(i);
+            const area = cv.contourArea(contour);
+            if (area < minArea || area > maxArea) {
+                contour.delete();
+                continue;
+            }
+
+            const rect = cv.minAreaRect(contour);
+            const rectArea = rect.size.width * rect.size.height;
+            const fillRatio = area / Math.max(rectArea, 1);
+            if (fillRatio < 0.35) {
+                contour.delete();
+                continue;
+            }
+
+            const warped = cropRectFromContour(src, contour);
+            contour.delete();
+            if (!warped) continue;
+
+            const ratio = warped.cols / warped.rows;
+            if (ratio < 0.35 || ratio > 3) {
+                warped.delete();
+                continue;
+            }
+
+            candidates.push({ mat: warped, area: warped.cols * warped.rows });
+        }
+
+        candidates.sort((a, b) => b.area - a.area);
+        const limited = candidates.slice(0, 60);
+        candidates.slice(60).forEach(item => item.mat.delete());
+
+        const files = [];
+        for (let i = 0; i < limited.length; i++) {
+            const item = limited[i];
+            const canvas = document.createElement('canvas');
+            canvas.width = item.mat.cols;
+            canvas.height = item.mat.rows;
+            cv.imshow(canvas, item.mat);
+            item.mat.delete();
+
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+            if (!blob) continue;
+            files.push(new File([blob], `sheet_photo_${String(i + 1).padStart(2, '0')}.jpg`, { type: 'image/jpeg' }));
+        }
+
+        src.delete();
+        gray.delete();
+        blur.delete();
+        edges.delete();
+        kernel.delete();
+        contours.delete();
+        hierarchy.delete();
+
+        return files;
     }
 
     // Process Target Images when selected
@@ -274,6 +429,45 @@ document.addEventListener('DOMContentLoaded', () => {
             await processTargets(files);
         }
     });
+
+    if (sheetImageInput) {
+        sheetImageInput.addEventListener('change', async (e) => {
+            pendingSheetImage = e.target.files[0] || null;
+            scanSheetBtn.classList.toggle('hidden', !pendingSheetImage);
+            sheetStatus.textContent = pendingSheetImage
+                ? `Loaded "${pendingSheetImage.name}". Click Auto-Detect Photos.`
+                : 'Tip: works best with top-down photos and good lighting.';
+
+            if (pendingSheetImage && isCvReady) {
+                scanSheetBtn.click();
+            }
+        });
+    }
+
+    if (scanSheetBtn) {
+        scanSheetBtn.addEventListener('click', async () => {
+            if (!pendingSheetImage) return;
+            scanSheetBtn.disabled = true;
+            scanSheetBtn.textContent = 'Detecting...';
+            sheetStatus.textContent = 'Scanning photo sheet and extracting each printed photo...';
+
+            try {
+                const extractedFiles = await extractPhotosFromSheet(pendingSheetImage);
+                if (extractedFiles.length === 0) {
+                    sheetStatus.textContent = 'No photo blocks detected. Try a sharper image with less glare or crop tighter to the prints.';
+                } else {
+                    await processTargets(extractedFiles);
+                    sheetStatus.textContent = `Detected ${extractedFiles.length} photos and loaded them as targets.`;
+                }
+            } catch (err) {
+                console.error('Photo sheet scan failed', err);
+                sheetStatus.textContent = err.message || 'Could not scan this sheet image. If this is HEIC/HEIF, export as JPG first.';
+            } finally {
+                scanSheetBtn.disabled = false;
+                scanSheetBtn.textContent = 'Auto-Detect Photos';
+            }
+        });
+    }
 
     directoryInput.addEventListener('change', (e) => {
         const files = Array.from(e.target.files);
