@@ -342,6 +342,20 @@ document.addEventListener('DOMContentLoaded', () => {
         return dst;
     }
 
+    function cropRectFromBounding(srcMat, rect) {
+        if (!rect) return null;
+        const padding = 8;
+        const x = Math.max(0, rect.x - padding);
+        const y = Math.max(0, rect.y - padding);
+        const maxW = srcMat.cols - x;
+        const maxH = srcMat.rows - y;
+        const w = Math.min(maxW, rect.width + (padding * 2));
+        const h = Math.min(maxH, rect.height + (padding * 2));
+        if (w < 60 || h < 60) return null;
+        const roi = new cv.Rect(x, y, w, h);
+        return srcMat.roi(roi).clone();
+    }
+
     function computeIoU(a, b) {
         const x1 = Math.max(a.x, b.x);
         const y1 = Math.max(a.y, b.y);
@@ -405,11 +419,11 @@ document.addEventListener('DOMContentLoaded', () => {
             cv.findContours(binary, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
         }
 
-        const minAreaRatio = 0.002 + ((5 - options.sensitivity) * 0.0005);
+        const minAreaRatio = 0.0009 + ((5 - options.sensitivity) * 0.00025);
         const maxAreaRatio = 0.5;
         const minArea = src.rows * src.cols * minAreaRatio;
         const maxArea = src.rows * src.cols * maxAreaRatio;
-        const minDimension = Math.max(70, Math.floor(Math.min(src.cols, src.rows) * 0.07));
+        const minDimension = Math.max(38, Math.floor(Math.min(src.cols, src.rows) * 0.04));
 
         let passAccepted = 0;
         for (let i = 0; i < contours.size(); i++) {
@@ -423,23 +437,26 @@ document.addEventListener('DOMContentLoaded', () => {
             const rect = cv.boundingRect(contour);
             const contourPerimeter = cv.arcLength(contour, true);
             const compactness = (4 * Math.PI * area) / Math.max(contourPerimeter * contourPerimeter, 1);
-            if (rect.width < minDimension || rect.height < minDimension || compactness < 0.15) {
+            if (rect.width < minDimension || rect.height < minDimension || compactness < 0.04) {
                 contour.delete();
                 continue;
             }
 
-            const warped = cropRectFromContour(src, contour);
+            let warped = cropRectFromContour(src, contour);
+            if (!warped) {
+                warped = cropRectFromBounding(src, rect);
+            }
             contour.delete();
             if (!warped) continue;
 
             const ratio = warped.cols / warped.rows;
-            if (ratio < 0.35 || ratio > 2.8) {
+            if (ratio < 0.22 || ratio > 4.2) {
                 warped.delete();
                 continue;
             }
 
             const bbox = { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
-            const duplicate = candidates.some(existing => computeIoU(existing.bbox, bbox) > 0.55);
+            const duplicate = candidates.some(existing => computeIoU(existing.bbox, bbox) > 0.72);
             if (duplicate) {
                 warped.delete();
                 continue;
@@ -486,7 +503,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const imgEl = await loadImage(file);
-        const src = getMatFromImage(imgEl);
+        const src = getMatFromImage(imgEl, 1400);
         if (!src) throw new Error('Unable to read photo sheet.');
 
         const scanOptions = {
