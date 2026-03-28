@@ -37,9 +37,21 @@
                     <div id="target-preview" class="preview-container"></div>
                 </div>
 
+                <!-- Contact Sheet Scanner Block -->
+                <div class="upload-card">
+                    <h2>2. Photo Sheet Scanner</h2>
+                    <p>Upload one image like your example and auto-split each printed photo.</p>
+                    <label class="custom-file-upload">
+                        <input type="file" id="sheet-image" accept="image/*">
+                        <span>Choose Photo Sheet Image</span>
+                    </label>
+                    <button id="scan-sheet-btn" class="secondary-btn hidden">Auto-Detect Photos</button>
+                    <p id="sheet-status" class="sheet-status">Tip: works best with top-down photos and good lighting.</p>
+                </div>
+
                 <!-- Search Directory Block -->
                 <div class="upload-card">
-                    <h2>2. Search Directory</h2>
+                    <h2>3. Search Directory</h2>
                     <p>Select a folder to search within.</p>
                     <label class="custom-file-upload">
                         <!-- webkitdirectory allows folder selection -->
