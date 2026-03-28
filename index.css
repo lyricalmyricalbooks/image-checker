@@ -153,6 +153,38 @@ input[type="file"] {
     margin-top: 0.25rem;
 }
 
+.scanner-controls {
+    width: 100%;
+    display: grid;
+    gap: 0.6rem;
+    text-align: left;
+    margin-top: -0.25rem;
+}
+
+.scanner-controls label {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.scanner-controls input[type="range"],
+.scanner-controls select {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.8);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.35rem 0.45rem;
+}
+
+.scanner-controls .scanner-checkbox {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+}
+
 .action-section {
     display: flex;
     justify-content: center;

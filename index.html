@@ -45,6 +45,26 @@
                         <input type="file" id="sheet-image" accept="image/*">
                         <span>Choose Photo Sheet Image</span>
                     </label>
+                    <div class="scanner-controls">
+                        <label>
+                            Detection Strength
+                            <input type="range" id="sheet-sensitivity" min="1" max="5" value="3">
+                        </label>
+                        <label>
+                            Max Photos
+                            <select id="sheet-max-photos">
+                                <option value="24">24</option>
+                                <option value="36" selected>36</option>
+                                <option value="48">48</option>
+                                <option value="60">60</option>
+                                <option value="80">80</option>
+                            </select>
+                        </label>
+                        <label class="scanner-checkbox">
+                            <input type="checkbox" id="sheet-enhance" checked>
+                            Improve contrast & denoise
+                        </label>
+                    </div>
                     <button id="scan-sheet-btn" class="secondary-btn hidden">Auto-Detect Photos</button>
                     <p id="sheet-status" class="sheet-status">Tip: works best with top-down photos and good lighting.</p>
                 </div>
