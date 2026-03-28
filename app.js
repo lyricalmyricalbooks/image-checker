@@ -47,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let selectedFiles = []; // Array of { file, card, badge }
     let draggedElement = null; // HTML element currently being dragged
     let pendingSheetImage = null;
+    const featureCache = new Map(); // key => { keypoints, descriptors }
 
     /* ========================================================================= */
     /* ========================= INDEXEDDB MEMORY ============================== */
@@ -174,17 +175,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Convert Image Element to cv.Mat
-    function getMatFromImage(imgElement) {
+    function getMatFromImage(imgElement, maxDim = 600) {
         const canvas = document.createElement('canvas');
         canvas.width = imgElement.naturalWidth || imgElement.width || 300;
         canvas.height = imgElement.naturalHeight || imgElement.height || 300;
         
         // Scale down huge images to prevent freezing the browser
-        const MAX_DIM = 600;
         let w = canvas.width;
         let h = canvas.height;
-        if (w > MAX_DIM || h > MAX_DIM) {
-            const ratio = Math.min(MAX_DIM/w, MAX_DIM/h);
+        if (w > maxDim || h > maxDim) {
+            const ratio = Math.min(maxDim/w, maxDim/h);
             w = Math.floor(w * ratio);
             h = Math.floor(h * ratio);
         }
@@ -203,32 +203,84 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Extract ORB Keypoints and Descriptors from an ImageElement
-    function extractFeatures(imgElement) {
-        const mat = getMatFromImage(imgElement);
+    // Includes grayscale normalization to improve lighting robustness.
+    function extractFeatures(imgElement, options = {}) {
+        const maxDim = options.maxDim || 600;
+        const orbFeatures = options.orbFeatures || 500;
+
+        const mat = getMatFromImage(imgElement, maxDim);
         if (!mat) return null;
 
         const gray = new cv.Mat();
+        const normalized = new cv.Mat();
         cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+        cv.equalizeHist(gray, normalized);
         
-        // 500 max features
-        const orb = new cv.ORB(500); 
+        const orb = new cv.ORB(orbFeatures); 
         const keypoints = new cv.KeyPointVector();
         const descriptors = new cv.Mat();
         const mask = new cv.Mat();
 
         try {
-            orb.detectAndCompute(gray, mask, keypoints, descriptors);
+            orb.detectAndCompute(normalized, mask, keypoints, descriptors);
         } catch (e) {
             console.error("ORB compute failed", e);
         }
         
         // Memory cleanup
         gray.delete();
+        normalized.delete();
         mask.delete();
         orb.delete();
         mat.delete();
 
         return { keypoints, descriptors };
+    }
+
+    function getFeatureCacheKey(file, options) {
+        return [
+            file.name,
+            file.size,
+            file.lastModified || 0,
+            options.maxDim || 600,
+            options.orbFeatures || 500
+        ].join('::');
+    }
+
+    async function getOrCreateFileFeatures(file, options = {}) {
+        const cacheKey = getFeatureCacheKey(file, options);
+        if (featureCache.has(cacheKey)) {
+            return featureCache.get(cacheKey);
+        }
+
+        const imgEl = await loadImage(file);
+        const feats = extractFeatures(imgEl, options);
+        if (feats && feats.descriptors && feats.descriptors.rows > 0) {
+            featureCache.set(cacheKey, feats);
+            return feats;
+        }
+
+        if (feats) {
+            if (feats.descriptors) feats.descriptors.delete();
+            if (feats.keypoints) feats.keypoints.delete();
+        }
+        return null;
+    }
+
+    async function getOrCreateHiResTargetFeatures(target) {
+        if (target.hiResFeatures) return target.hiResFeatures;
+        const feats = await getOrCreateFileFeatures(target.file, { maxDim: 1024, orbFeatures: 1200 });
+        target.hiResFeatures = feats;
+        return feats;
+    }
+
+    function clearFeatureCache() {
+        featureCache.forEach(feats => {
+            if (!feats) return;
+            if (feats.descriptors && !feats.descriptors.isDeleted()) feats.descriptors.delete();
+            if (feats.keypoints && !feats.keypoints.isDeleted()) feats.keypoints.delete();
+        });
+        featureCache.clear();
     }
 
     function orderCornerPoints(points) {
@@ -387,6 +439,11 @@ document.addEventListener('DOMContentLoaded', () => {
         for (let t of targetDescriptorsList) {
             if (t.descriptors && !t.descriptors.isDeleted()) t.descriptors.delete();
             if (t.keypoints && !t.keypoints.isDeleted()) t.keypoints.delete();
+            if (t.hiResFeatures) {
+                if (t.hiResFeatures.descriptors && !t.hiResFeatures.descriptors.isDeleted()) t.hiResFeatures.descriptors.delete();
+                if (t.hiResFeatures.keypoints && !t.hiResFeatures.keypoints.isDeleted()) t.hiResFeatures.keypoints.delete();
+                t.hiResFeatures = null;
+            }
         }
         targetDescriptorsList = [];
 
@@ -401,7 +458,7 @@ document.addEventListener('DOMContentLoaded', () => {
             targetPreview.appendChild(imgEl);
 
             try {
-                const feats = extractFeatures(imgEl);
+                const feats = extractFeatures(imgEl, { maxDim: 600, orbFeatures: 500 });
                 if (feats && feats.descriptors.rows > 0) {
                     targetDescriptorsList.push({ file, ...feats });
                 }
@@ -457,6 +514,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     directoryInput.addEventListener('change', (e) => {
         const files = Array.from(e.target.files);
+        clearFeatureCache(); // reset cache when directory scope changes
         
         searchFiles = files.filter(file => 
             file.type.startsWith('image/') || 
@@ -490,13 +548,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // Safety init check
     checkReadyState();
 
-    // Helper: Compare descriptors using Brute Force KNN and Lowe's Ratio Test
-    function isMatch(desc1, desc2) {
-        if (desc1.rows === 0 || desc2.rows === 0) return false;
+    // Helper: Compare descriptors with Lowe's ratio + geometric verification (RANSAC)
+    function evaluateMatch(targetFeatures, queryFeatures) {
+        const desc1 = targetFeatures.descriptors;
+        const desc2 = queryFeatures.descriptors;
+        if (desc1.rows === 0 || desc2.rows === 0) {
+            return { isMatch: false, confidence: 'Low', score: 0, goodMatches: 0, inliers: 0, inlierRatio: 0 };
+        }
         
         // NORM_HAMMING is necessary for ORB (binary descriptors)
         const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
         const matches = new cv.DMatchVectorVector();
+        let isMatched = false;
+        let confidence = 'Low';
+        let score = 0;
+        let inliers = 0;
+        let inlierRatio = 0;
         
         try {
             bf.knnMatch(desc2, desc1, matches, 2);
@@ -504,10 +571,12 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error("KNN Match failed", e);
             bf.delete();
             matches.delete();
-            return false;
+            return { isMatch: false, confidence: 'Low', score: 0, goodMatches: 0, inliers: 0, inlierRatio: 0 };
         }
 
         let goodMatches = 0;
+        const srcPoints = []; // target points
+        const dstPoints = []; // query/search points
         // Lowe's ratio test filter
         const RATIO_THRESHOLD = 0.75;
         
@@ -518,17 +587,62 @@ document.addEventListener('DOMContentLoaded', () => {
                 const dMatch2 = match.get(1);
                 if (dMatch1.distance <= RATIO_THRESHOLD * dMatch2.distance) {
                     goodMatches++;
+                    const targetKp = targetFeatures.keypoints.get(dMatch1.trainIdx);
+                    const queryKp = queryFeatures.keypoints.get(dMatch1.queryIdx);
+                    srcPoints.push(targetKp.pt.x, targetKp.pt.y);
+                    dstPoints.push(queryKp.pt.x, queryKp.pt.y);
                 }
             } else if (match.size() === 1) {
+                const dMatch = match.get(0);
                 goodMatches++;
+                const targetKp = targetFeatures.keypoints.get(dMatch.trainIdx);
+                const queryKp = queryFeatures.keypoints.get(dMatch.queryIdx);
+                srcPoints.push(targetKp.pt.x, targetKp.pt.y);
+                dstPoints.push(queryKp.pt.x, queryKp.pt.y);
             }
         }
-        
+
+        // Adaptive minimum good matches scales by descriptor count
+        const minGoodMatches = Math.max(8, Math.floor(0.08 * Math.min(desc1.rows, desc2.rows)));
+
+        // Geometric verification using homography and RANSAC
+        if (goodMatches >= 4 && srcPoints.length >= 8 && dstPoints.length >= 8) {
+            const srcMat = cv.matFromArray(goodMatches, 1, cv.CV_32FC2, srcPoints);
+            const dstMat = cv.matFromArray(goodMatches, 1, cv.CV_32FC2, dstPoints);
+            const inlierMask = new cv.Mat();
+            let H = null;
+
+            try {
+                H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 3.0, inlierMask);
+                if (H && !H.empty()) {
+                    for (let i = 0; i < inlierMask.rows; i++) {
+                        if (inlierMask.data[i]) inliers++;
+                    }
+                    inlierRatio = inliers / Math.max(goodMatches, 1);
+                }
+            } catch (e) {
+                console.error("Homography check failed", e);
+            } finally {
+                if (H) H.delete();
+                srcMat.delete();
+                dstMat.delete();
+                inlierMask.delete();
+            }
+        }
+
+        const minInliers = Math.max(6, Math.floor(minGoodMatches * 0.5));
+        isMatched = goodMatches >= minGoodMatches && inliers >= minInliers && inlierRatio >= 0.35;
+
+        // Confidence + score for UI/debugging
+        score = Math.round((Math.min(goodMatches / 40, 1) * 35) + (Math.min(inliers / 25, 1) * 35) + (inlierRatio * 30));
+        if (isMatched && inlierRatio >= 0.6 && inliers >= 20) confidence = 'High';
+        else if (isMatched && inlierRatio >= 0.45 && inliers >= 10) confidence = 'Medium';
+        else confidence = 'Low';
+
         bf.delete();
         matches.delete();
-        
-        // We require at least 15 solid matching keypoints to consider it a real "partial" match
-        return goodMatches >= 15;
+
+        return { isMatch: isMatched, confidence, score, goodMatches, inliers, inlierRatio };
     }
 
     // Execute Search Logic
@@ -561,24 +675,42 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             try {
-                const imgEl = await loadImage(file);
-                const feats = extractFeatures(imgEl);
+                const fastFeats = await getOrCreateFileFeatures(file, { maxDim: 600, orbFeatures: 500 });
                 
-                if (feats && feats.descriptors.rows > 0) {
-                    // Check against all target images
+                if (fastFeats && fastFeats.descriptors.rows > 0) {
+                    // Check against all target images and keep best-scoring verified match
+                    let bestMatch = null;
                     for (const target of targetDescriptorsList) {
-                        if (isMatch(target.descriptors, feats.descriptors)) {
-                            matchesFound++;
-                            displayMatch(file, target.file.name);
-                            break; // matched this file once, move to next file
+                        const matchResult = evaluateMatch(target, fastFeats);
+                        if (matchResult.isMatch) {
+                            if (!bestMatch || matchResult.score > bestMatch.matchResult.score) {
+                                bestMatch = { target, matchResult };
+                            }
                         }
                     }
-                }
-                
-                // Cleanup current search image features from memory
-                if (feats) {
-                    if (feats.descriptors) feats.descriptors.delete();
-                    if (feats.keypoints) feats.keypoints.delete();
+
+                    // High-resolution recovery pass if first pass did not confidently match
+                    if (!bestMatch) {
+                        const hiResQuery = await getOrCreateFileFeatures(file, { maxDim: 1024, orbFeatures: 1200 });
+                        if (hiResQuery && hiResQuery.descriptors.rows > 0) {
+                            for (const target of targetDescriptorsList) {
+                                const hiResTarget = await getOrCreateHiResTargetFeatures(target);
+                                if (!hiResTarget) continue;
+                                const matchResult = evaluateMatch(hiResTarget, hiResQuery);
+                                if (matchResult.isMatch) {
+                                    matchResult.stage = 'High-Res verification';
+                                    if (!bestMatch || matchResult.score > bestMatch.matchResult.score) {
+                                        bestMatch = { target, matchResult };
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestMatch) {
+                        matchesFound++;
+                        displayMatch(file, bestMatch.target.file.name, bestMatch.matchResult);
+                    }
                 }
             } catch (err) {
                 console.error('Failed to process search file:', file.name, err);
@@ -603,6 +735,7 @@ document.addEventListener('DOMContentLoaded', () => {
         exportBar.classList.add('hidden');
         resultsSection.classList.add('hidden');
         clearMemoryBtn.classList.add('hidden');
+        clearFeatureCache();
         
         await clearDB();
     });
@@ -702,7 +835,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function displayMatch(file, matchedTargetName) {
+    function displayMatch(file, matchedTargetName, matchMeta = null) {
         const url = URL.createObjectURL(file);
         
         const card = document.createElement('div');
@@ -729,7 +862,14 @@ document.addEventListener('DOMContentLoaded', () => {
         matchInfo.className = 'result-path';
         matchInfo.style.color = 'var(--primary)';
         matchInfo.style.marginTop = '0.4rem';
-        matchInfo.textContent = `Matched: ${matchedTargetName}`;
+        let matchText = `Matched: ${matchedTargetName}`;
+        if (matchMeta) {
+            const ratioPct = Math.round((matchMeta.inlierRatio || 0) * 100);
+            matchText += ` • ${matchMeta.confidence} confidence`;
+            matchText += ` (score ${matchMeta.score}, inliers ${matchMeta.inliers}/${matchMeta.goodMatches}, ${ratioPct}% inlier ratio)`;
+            if (matchMeta.stage) matchText += ` • ${matchMeta.stage}`;
+        }
+        matchInfo.textContent = matchText;
 
         details.appendChild(name);
         details.appendChild(path);
