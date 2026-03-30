@@ -296,24 +296,27 @@ document.addEventListener('DOMContentLoaded', () => {
         return [topLeft, topRight, bottomRight, bottomLeft];
     }
 
+    function getCornersFromMinAreaRect(rect) {
+        const angle = rect.angle * Math.PI / 180.0;
+        const b = Math.cos(angle) * 0.5;
+        const a = Math.sin(angle) * 0.5;
+        const pts = [];
+        pts.push({ x: rect.center.x - a * rect.size.height - b * rect.size.width, y: rect.center.y + b * rect.size.height - a * rect.size.width });
+        pts.push({ x: rect.center.x + a * rect.size.height - b * rect.size.width, y: rect.center.y - b * rect.size.height - a * rect.size.width });
+        pts.push({ x: rect.center.x + a * rect.size.height + b * rect.size.width, y: rect.center.y - b * rect.size.height + a * rect.size.width });
+        pts.push({ x: rect.center.x - a * rect.size.height + b * rect.size.width, y: rect.center.y + b * rect.size.height + a * rect.size.width });
+        return pts;
+    }
+
     function cropRectFromContour(srcMat, contour) {
-        const peri = cv.arcLength(contour, true);
-        const approx = new cv.Mat();
-        cv.approxPolyDP(contour, approx, 0.04 * peri, true);
-        if (approx.rows !== 4) {
-            approx.delete();
-            return null;
+        let rotatedRect;
+        try {
+            rotatedRect = cv.minAreaRect(contour);
+        } catch (e) {
+            return null; // fallback to bounding rect
         }
 
-        const points = [];
-        for (let i = 0; i < 4; i++) {
-            points.push({
-                x: approx.intPtr(i, 0)[0],
-                y: approx.intPtr(i, 0)[1]
-            });
-        }
-        approx.delete();
-
+        const points = getCornersFromMinAreaRect(rotatedRect);
         const [tl, tr, br, bl] = orderCornerPoints(points);
 
         const widthA = Math.hypot(br.x - bl.x, br.y - bl.y);
@@ -324,7 +327,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const heightB = Math.hypot(tl.x - bl.x, tl.y - bl.y);
         const maxHeight = Math.max(Math.floor(heightA), Math.floor(heightB));
 
-        if (maxWidth < 80 || maxHeight < 80) return null;
+        if (maxWidth < 60 || maxHeight < 60) return null;
 
         const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
             tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y
@@ -334,7 +337,17 @@ document.addEventListener('DOMContentLoaded', () => {
         ]);
         const M = cv.getPerspectiveTransform(srcTri, dstTri);
         const dst = new cv.Mat();
-        cv.warpPerspective(srcMat, dst, M, new cv.Size(maxWidth, maxHeight));
+        
+        try {
+            cv.warpPerspective(srcMat, dst, M, new cv.Size(maxWidth, maxHeight));
+        } catch (e) {
+            srcTri.delete();
+            dstTri.delete();
+            M.delete();
+            dst.delete();
+            return null;
+        }
+
         srcTri.delete();
         dstTri.delete();
         M.delete();
@@ -419,11 +432,11 @@ document.addEventListener('DOMContentLoaded', () => {
             cv.findContours(binary, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
         }
 
-        const minAreaRatio = 0.0009 + ((5 - options.sensitivity) * 0.00025);
-        const maxAreaRatio = 0.5;
+        const minAreaRatio = 0.0004 + ((5 - options.sensitivity) * 0.00015);
+        const maxAreaRatio = 0.8;
         const minArea = src.rows * src.cols * minAreaRatio;
         const maxArea = src.rows * src.cols * maxAreaRatio;
-        const minDimension = Math.max(38, Math.floor(Math.min(src.cols, src.rows) * 0.04));
+        const minDimension = Math.max(25, Math.floor(Math.min(src.cols, src.rows) * 0.02));
 
         let passAccepted = 0;
         for (let i = 0; i < contours.size(); i++) {
@@ -437,7 +450,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const rect = cv.boundingRect(contour);
             const contourPerimeter = cv.arcLength(contour, true);
             const compactness = (4 * Math.PI * area) / Math.max(contourPerimeter * contourPerimeter, 1);
-            if (rect.width < minDimension || rect.height < minDimension || compactness < 0.04) {
+            if (rect.width < minDimension || rect.height < minDimension || compactness < 0.01) {
                 contour.delete();
                 continue;
             }
@@ -450,7 +463,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!warped) continue;
 
             const ratio = warped.cols / warped.rows;
-            if (ratio < 0.22 || ratio > 4.2) {
+            if (ratio < 0.05 || ratio > 20) {
                 warped.delete();
                 continue;
             }
